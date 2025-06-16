@@ -11,7 +11,7 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# Generate sample data
+# Generate sample data/
 np.random.seed(42)
 X, y_true = make_blobs(n_samples=6000, centers=6, cluster_std=1, random_state=42)
 

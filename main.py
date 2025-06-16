@@ -1,128 +1,39 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from sklearn.mixture import GaussianMixture
+from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 from sklearn.metrics import silhouette_score, adjusted_rand_score, calinski_harabasz_score
 from sklearn.datasets import make_blobs
 from scipy.stats import multivariate_normal
 from scipy.spatial.distance import cdist
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN
 import warnings
+from sklearn.model_selection import GridSearchCV
+from sklearn.base import BaseEstimator, ClusterMixin
+import time
+import logging
+import concurrent.futures
 
 warnings.filterwarnings('ignore')
 
-# Generate sample data/
+# Generate sample data
 np.random.seed(42)
-X, y_true = make_blobs(n_samples=6000, centers=6, cluster_std=1, random_state=42)
+X, y_true = make_blobs(n_samples=6000, centers=12, cluster_std=1, random_state=42)
 
 
-class ImprovedMolecularDPMM:
-    """
-    Покращена версія з зворотним проходом для оптимізації кількості кластерів
-    """
+# === Додаткові DPMM моделі ===
 
-    def __init__(self, alpha=1.0, max_iter=12, min_cluster_size=5,
-                 initial_split_threshold=0.3, refinement_threshold=0.1,
-                 max_clusters=40, use_smart_init=True,
-                 backward_optimization=True, target_clusters=None):
-        """
-        Parameters:
-        -----------
-        backward_optimization : bool
-            Використовувати зворотний прохід для оптимізації
-        target_clusters : int or None
-            Цільова кількість кластерів (якщо відома)
-        """
+class StandardDPMM:
+    """Стандартна DPMM з простим поділом"""
+
+    def __init__(self, alpha=1.0, max_iter=10, min_cluster_size=5):
         self.alpha = alpha
         self.max_iter = max_iter
         self.min_cluster_size = min_cluster_size
-        self.initial_split_threshold = initial_split_threshold
-        self.refinement_threshold = refinement_threshold
-        self.max_clusters = max_clusters
-        self.use_smart_init = use_smart_init
-        self.backward_optimization = backward_optimization
-        self.target_clusters = target_clusters
-
-        # Внутрішні параметри
         self.clusters = []
         self.n_clusters = 0
-        self.converged = False
-        self.quality_history = []
-        self.backward_history = []
-        self.best_configuration = None
-        self.best_score = -np.inf
 
-    def _calculate_cluster_spread(self, cluster_data):
-        """Розрахунок розкиданості точок в кластері"""
-        if len(cluster_data) < 4:
-            return 0.0
-
-        center = np.mean(cluster_data, axis=0)
-        distances = np.linalg.norm(cluster_data - center, axis=1)
-        cv = np.std(distances) / (np.mean(distances) + 1e-8)
-
-        if cluster_data.shape[1] > 1:
-            pca = PCA(n_components=2)
-            pca.fit(cluster_data)
-            explained_ratio = pca.explained_variance_ratio_
-            elongation = explained_ratio[0] - explained_ratio[1] if len(explained_ratio) > 1 else explained_ratio[0]
-        else:
-            elongation = 0.5
-
-        spread_score = cv * 0.7 + elongation * 0.3
-        return spread_score
-
-    def _smart_initialization(self, X):
-        """Розумна ініціалізація з K-means"""
-        print("  Using smart initialization with K-means...")
-
-        best_k = 1
-        best_score = -np.inf
-
-        for k in range(2, min(8, len(X) // 50)):
-            try:
-                kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-                labels = kmeans.fit_predict(X)
-
-                if len(np.unique(labels)) > 1:
-                    score = silhouette_score(X, labels)
-                    if score > best_score:
-                        best_score = score
-                        best_k = k
-            except:
-                continue
-
-        if best_k > 1:
-            print(f"    → Initializing with {best_k} clusters (silhouette: {best_score:.3f})")
-            kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(X)
-
-            self.clusters = []
-            for k in range(best_k):
-                cluster_data = X[labels == k]
-                if len(cluster_data) > 0:
-                    cluster = {
-                        'data': cluster_data,
-                        'mean': np.mean(cluster_data, axis=0),
-                        'cov': np.cov(cluster_data.T) + np.eye(cluster_data.shape[1]) * 1e-6,
-                        'weight': len(cluster_data) / len(X),
-                        'size': len(cluster_data),
-                        'id': len(self.clusters)
-                    }
-                    self.clusters.append(cluster)
-
-            self.n_clusters = len(self.clusters)
-            return True
-
-        return False
-
-    def _initialize_clusters(self, X):
-        """Ініціалізація кластерів"""
-        if self.use_smart_init:
-            if self._smart_initialization(X):
-                return
-
-        print("  Using single cluster initialization...")
+    def _initialize_single_cluster(self, X):
         cluster = {
             'data': X.copy(),
             'mean': np.mean(X, axis=0),
@@ -134,272 +45,302 @@ class ImprovedMolecularDPMM:
         self.clusters = [cluster]
         self.n_clusters = 1
 
-    def _enhanced_split_analysis(self, cluster_data):
-        """Покращений аналіз можливості поділу"""
-        if len(cluster_data) < 6:
+    def _simple_split(self, cluster_data):
+        """Простий поділ по медіані найбільшої компоненти"""
+        if len(cluster_data) < self.min_cluster_size:
+            return None
+
+        # Знаходимо напрямок з найбільшою варіацією
+        variances = np.var(cluster_data, axis=0)
+        split_dim = np.argmax(variances)
+
+        # Ділимо по медіані
+        median_val = np.median(cluster_data[:, split_dim])
+        mask1 = cluster_data[:, split_dim] <= median_val
+        mask2 = cluster_data[:, split_dim] > median_val
+
+        if np.sum(mask1) >= 3 and np.sum(mask2) >= 3:
+            return cluster_data[mask1], cluster_data[mask2]
+        return None
+
+    def predict(self, X):
+        if self.n_clusters <= 1:
+            return np.zeros(len(X), dtype=int)
+
+        labels = np.zeros(len(X))
+        for i, point in enumerate(X):
+            distances = [np.linalg.norm(point - cluster['mean'])
+                         for cluster in self.clusters]
+            labels[i] = np.argmin(distances)
+        return labels.astype(int)
+
+    def fit(self, X):
+        self._initialize_single_cluster(X)
+
+        for iteration in range(self.max_iter):
+            new_clusters = []
+            any_split = False
+
+            for cluster in self.clusters:
+                if cluster['size'] >= self.min_cluster_size * 2:
+                    split_result = self._simple_split(cluster['data'])
+                    if split_result is not None:
+                        part1, part2 = split_result
+                        # Створюємо два нові кластери
+                        for part in [part1, part2]:
+                            new_cluster = {
+                                'data': part,
+                                'mean': np.mean(part, axis=0),
+                                'cov': np.cov(part.T) + np.eye(part.shape[1]) * 1e-6,
+                                'weight': len(part) / len(X),
+                                'size': len(part),
+                                'id': len(new_clusters)
+                            }
+                            new_clusters.append(new_cluster)
+                        any_split = True
+                    else:
+                        new_clusters.append(cluster)
+                else:
+                    new_clusters.append(cluster)
+
+            self.clusters = new_clusters
+            self.n_clusters = len(self.clusters)
+
+            if not any_split:
+                break
+
+        return self
+
+
+class VariationalDPMM:
+    """Варіаційна DPMM з використанням Bayesian Gaussian Mixture"""
+
+    def __init__(self, max_components=20, alpha=1.0):
+        self.max_components = max_components
+        self.alpha = alpha
+        self.model = BayesianGaussianMixture(
+            n_components=max_components,
+            weight_concentration_prior=alpha,
+            random_state=42,
+            max_iter=200,
+            n_init=3
+        )
+        self.n_clusters = 0
+
+    def fit(self, X):
+        self.model.fit(X)
+        # Визначаємо активні компоненти
+        weights = self.model.weights_
+        active_components = weights > 0.01  # Поріг для активних компонент
+        self.n_clusters = np.sum(active_components)
+        return self
+
+    def predict(self, X):
+        labels = self.model.predict(X)
+        # Перемаппінг міток для активних компонент
+        unique_labels = np.unique(labels)
+        label_map = {old: new for new, old in enumerate(unique_labels)}
+        return np.array([label_map[label] for label in labels])
+
+
+class HierarchicalDPMM:
+    """Ієрархічна DPMM з поетапним поділом"""
+
+    def __init__(self, alpha=1.0, max_depth=4, min_cluster_size=10):
+        self.alpha = alpha
+        self.max_depth = max_depth
+        self.min_cluster_size = min_cluster_size
+        self.clusters = []
+        self.n_clusters = 0
+
+    def _split_cluster_hierarchical(self, data, depth=0):
+        """Рекурсивний ієрархічний поділ"""
+        if len(data) < self.min_cluster_size or depth >= self.max_depth:
+            return [data]
+
+        # Використовуємо K-means для поділу на 2
+        try:
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(data)
+
+            part1 = data[labels == 0]
+            part2 = data[labels == 1]
+
+            if len(part1) < 3 or len(part2) < 3:
+                return [data]
+
+            # Оцінюємо якість поділу
+            silhouette = silhouette_score(data, labels)
+            if silhouette < 0.3:  # Поріг якості
+                return [data]
+
+            # Рекурсивно ділимо кожну частину
+            result = []
+            result.extend(self._split_cluster_hierarchical(part1, depth + 1))
+            result.extend(self._split_cluster_hierarchical(part2, depth + 1))
+            return result
+
+        except:
+            return [data]
+
+    def fit(self, X):
+        # Ієрархічний поділ
+        cluster_parts = self._split_cluster_hierarchical(X)
+
+        # Створюємо кластери
+        self.clusters = []
+        for i, part in enumerate(cluster_parts):
+            cluster = {
+                'data': part,
+                'mean': np.mean(part, axis=0),
+                'cov': np.cov(part.T) + np.eye(part.shape[1]) * 1e-6,
+                'weight': len(part) / len(X),
+                'size': len(part),
+                'id': i
+            }
+            self.clusters.append(cluster)
+
+        self.n_clusters = len(self.clusters)
+        return self
+
+    def predict(self, X):
+        if self.n_clusters <= 1:
+            return np.zeros(len(X), dtype=int)
+
+        labels = np.zeros(len(X))
+        for i, point in enumerate(X):
+            distances = [np.linalg.norm(point - cluster['mean'])
+                         for cluster in self.clusters]
+            labels[i] = np.argmin(distances)
+        return labels.astype(int)
+
+
+class AdaptiveDPMM:
+    """Адаптивна DPMM з динамічними параметрами"""
+
+    def __init__(self, initial_alpha=1.0, min_cluster_size=5):
+        self.initial_alpha = initial_alpha
+        self.min_cluster_size = min_cluster_size
+        self.clusters = []
+        self.n_clusters = 0
+
+    def _adaptive_split_threshold(self, cluster_size, iteration):
+        """Адаптивний поріг поділу"""
+        base_threshold = 0.3
+        size_factor = min(2.0, cluster_size / 50.0)
+        iteration_decay = 0.9 ** iteration
+        return base_threshold * size_factor * iteration_decay
+
+    def _evaluate_split_adaptive(self, data):
+        """Адаптивна оцінка поділу"""
+        if len(data) < 6:
             return None, 0.0
 
         best_split = None
         best_score = 0.0
 
-        # PCA-based поділ
-        pca = PCA(n_components=min(cluster_data.shape[1], 2))
-        pca.fit(cluster_data)
+        # Пробуємо різні методи поділу
+        methods = ['kmeans', 'pca', 'variance']
 
-        for comp_idx in range(pca.n_components_):
-            projections = pca.transform(cluster_data)[:, comp_idx]
+        for method in methods:
+            if method == 'kmeans':
+                try:
+                    kmeans = KMeans(n_clusters=2, random_state=42, n_init=5)
+                    labels = kmeans.fit_predict(data)
+                    part1, part2 = data[labels == 0], data[labels == 1]
+                except:
+                    continue
 
-            for percentile in [30, 40, 50, 60, 70]:
-                threshold = np.percentile(projections, percentile)
-                mask1 = projections <= threshold
-                mask2 = projections > threshold
+            elif method == 'pca':
+                try:
+                    pca = PCA(n_components=1)
+                    projections = pca.fit_transform(data).ravel()
+                    median_val = np.median(projections)
+                    mask1 = projections <= median_val
+                    mask2 = projections > median_val
+                    part1, part2 = data[mask1], data[mask2]
+                except:
+                    continue
 
-                if np.sum(mask1) >= 3 and np.sum(mask2) >= 3:
-                    part1, part2 = cluster_data[mask1], cluster_data[mask2]
-                    score = self._evaluate_split_quality(cluster_data, part1, part2)
+            elif method == 'variance':
+                variances = np.var(data, axis=0)
+                split_dim = np.argmax(variances)
+                median_val = np.median(data[:, split_dim])
+                mask1 = data[:, split_dim] <= median_val
+                mask2 = data[:, split_dim] > median_val
+                part1, part2 = data[mask1], data[mask2]
+
+            if len(part1) >= 3 and len(part2) >= 3:
+                # Оцінюємо якість поділу
+                try:
+                    combined_data = np.vstack([part1, part2])
+                    labels = np.hstack([np.zeros(len(part1)), np.ones(len(part2))])
+                    score = silhouette_score(combined_data, labels)
 
                     if score > best_score:
                         best_score = score
                         best_split = (part1, part2)
-
-        # K-means поділ
-        try:
-            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-            split_labels = kmeans.fit_predict(cluster_data)
-
-            part1 = cluster_data[split_labels == 0]
-            part2 = cluster_data[split_labels == 1]
-
-            if len(part1) >= 3 and len(part2) >= 3:
-                score = self._evaluate_split_quality(cluster_data, part1, part2)
-                if score > best_score:
-                    best_score = score
-                    best_split = (part1, part2)
-        except:
-            pass
+                except:
+                    continue
 
         return best_split, best_score
 
-    def _evaluate_split_quality(self, original, part1, part2):
-        """Комплексна оцінка якості поділу"""
-        if len(part1) < 3 or len(part2) < 3:
-            return 0.0
+    def fit(self, X):
+        # Початкова ініціалізація
+        cluster = {
+            'data': X.copy(),
+            'mean': np.mean(X, axis=0),
+            'cov': np.cov(X.T) + np.eye(X.shape[1]) * 1e-6,
+            'weight': 1.0,
+            'size': len(X),
+            'id': 0
+        }
+        self.clusters = [cluster]
+        self.n_clusters = 1
 
-        def compactness(data):
-            if len(data) < 2:
-                return 0
-            center = np.mean(data, axis=0)
-            return np.mean(np.linalg.norm(data - center, axis=1))
-
-        original_compactness = compactness(original)
-        new_compactness = (len(part1) * compactness(part1) + len(part2) * compactness(part2)) / len(original)
-        compactness_improvement = (original_compactness - new_compactness) / (original_compactness + 1e-8)
-
-        center1 = np.mean(part1, axis=0)
-        center2 = np.mean(part2, axis=0)
-        separation = np.linalg.norm(center1 - center2)
-        avg_size = (compactness(part1) + compactness(part2)) / 2
-        separation_score = separation / (avg_size + 1e-8)
-
-        size_ratio = min(len(part1), len(part2)) / max(len(part1), len(part2))
-        balance_score = size_ratio
-
-        try:
-            from scipy.stats import ttest_ind
-            if original.shape[1] == 1:
-                _, p_value = ttest_ind(part1.ravel(), part2.ravel())
-            else:
-                pca = PCA(n_components=1)
-                proj1 = pca.fit_transform(part1).ravel()
-                proj2 = pca.fit_transform(part2).ravel()
-                _, p_value = ttest_ind(proj1, proj2)
-
-            significance_score = max(0, 1 - p_value)
-        except:
-            significance_score = 0.5
-
-        total_score = (
-                compactness_improvement * 0.3 +
-                min(separation_score, 2.0) * 0.25 +
-                balance_score * 0.2 +
-                significance_score * 0.25
-        )
-
-        return max(0, total_score)
-
-    def _should_split_cluster(self, cluster, iteration):
-        """Рішення про поділ кластера"""
-        cluster_data = cluster['data']
-        cluster_size = len(cluster_data)
-
-        if cluster_size < self.min_cluster_size or self.n_clusters >= self.max_clusters:
-            return False, None, 0.0
-
-        spread = self._calculate_cluster_spread(cluster_data)
-        split_result, split_score = self._enhanced_split_analysis(cluster_data)
-
-        if iteration <= 2:
-            threshold = self.initial_split_threshold
-        else:
-            threshold = self.refinement_threshold
-
-        size_factor = min(2.0, cluster_size / 50.0)
-        final_score = split_score * size_factor
-        should_split = final_score > threshold
-
-        return should_split, split_result, final_score
-
-    def _calculate_merge_score(self, cluster1, cluster2):
-        """Розрахунок score для об'єднання двох кластерів"""
-        data1, data2 = cluster1['data'], cluster2['data']
-
-        # Відстань між центрами
-        center_distance = np.linalg.norm(cluster1['mean'] - cluster2['mean'])
-
-        # Розміри кластерів
-        size1, size2 = len(data1), len(data2)
-
-        # Симетрія розмірів (краще об'єднувати схожі за розміром)
-        size_balance = min(size1, size2) / max(size1, size2)
-
-        # Компактність після об'єднання
-        merged_data = np.vstack([data1, data2])
-        merged_center = np.mean(merged_data, axis=0)
-        merged_compactness = np.mean(np.linalg.norm(merged_data - merged_center, axis=1))
-
-        # Середня компактність до об'єднання
-        comp1 = np.mean(np.linalg.norm(data1 - cluster1['mean'], axis=1))
-        comp2 = np.mean(np.linalg.norm(data2 - cluster2['mean'], axis=1))
-        avg_compactness = (comp1 * size1 + comp2 * size2) / (size1 + size2)
-
-        # Збільшення компактності (негативне означає погіршення)
-        compactness_change = (avg_compactness - merged_compactness) / avg_compactness
-
-        # Нормована відстань
-        avg_spread = (self._calculate_cluster_spread(data1) + self._calculate_cluster_spread(data2)) / 2
-        normalized_distance = center_distance / (avg_spread + 1e-8)
-
-        # Комбінований score (більший = краще для об'єднання)
-        merge_score = (
-                size_balance * 0.3 +
-                compactness_change * 0.4 +
-                (1 / (normalized_distance + 1)) * 0.3
-        )
-
-        return merge_score, normalized_distance
-
-    def _backward_optimization(self, X):
-        """Зворотний прохід для оптимізації кількості кластерів"""
-        print(f"\n=== BACKWARD OPTIMIZATION ===")
-        print(f"Starting with {self.n_clusters} clusters")
-
-        # Зберігаємо поточну найкращу конфігурацію
-        current_labels = self.predict(X)
-        if len(np.unique(current_labels)) > 1:
-            current_score = silhouette_score(X, current_labels)
-            self.best_score = current_score
-            self.best_configuration = {
-                'clusters': [cluster.copy() for cluster in self.clusters],
-                'n_clusters': self.n_clusters,
-                'score': current_score,
-                'labels': current_labels.copy()
-            }
-            print(f"Initial score: {current_score:.4f}")
-
-        iteration = 0
-        while self.n_clusters > 2:
-            iteration += 1
-            print(f"\n[BACKWARD {iteration}] Current clusters: {self.n_clusters}")
-
-            # Знаходимо найкращу пару для об'єднання
-            best_merge = None
-            best_merge_score = -np.inf
-
-            for i in range(self.n_clusters):
-                for j in range(i + 1, self.n_clusters):
-                    merge_score, distance = self._calculate_merge_score(self.clusters[i], self.clusters[j])
-
-                    if merge_score > best_merge_score:
-                        best_merge_score = merge_score
-                        best_merge = (i, j, distance)
-
-            if best_merge is None:
-                break
-
-            i, j, distance = best_merge
-            print(f"  Merging clusters {i + 1} and {j + 1} (score: {best_merge_score:.3f}, dist: {distance:.3f})")
-
-            # Виконуємо об'єднання
-            cluster1 = self.clusters[i]
-            cluster2 = self.clusters[j]
-
-            merged_data = np.vstack([cluster1['data'], cluster2['data']])
-            merged_cluster = {
-                'data': merged_data,
-                'mean': np.mean(merged_data, axis=0),
-                'cov': np.cov(merged_data.T) + np.eye(merged_data.shape[1]) * 1e-6,
-                'weight': cluster1['weight'] + cluster2['weight'],
-                'size': len(merged_data),
-                'id': cluster1['id']
-            }
-
-            # Оновлюємо список кластерів
+        for iteration in range(8):
             new_clusters = []
-            for k, cluster in enumerate(self.clusters):
-                if k not in [i, j]:
+            any_split = False
+
+            for cluster in self.clusters:
+                cluster_size = cluster['size']
+                threshold = self._adaptive_split_threshold(cluster_size, iteration)
+
+                if cluster_size >= self.min_cluster_size * 2:
+                    split_result, score = self._evaluate_split_adaptive(cluster['data'])
+
+                    if split_result is not None and score > threshold:
+                        part1, part2 = split_result
+
+                        for part in [part1, part2]:
+                            new_cluster = {
+                                'data': part,
+                                'mean': np.mean(part, axis=0),
+                                'cov': np.cov(part.T) + np.eye(part.shape[1]) * 1e-6,
+                                'weight': len(part) / len(X),
+                                'size': len(part),
+                                'id': len(new_clusters)
+                            }
+                            new_clusters.append(new_cluster)
+                        any_split = True
+                    else:
+                        new_clusters.append(cluster)
+                else:
                     new_clusters.append(cluster)
-            new_clusters.append(merged_cluster)
 
             self.clusters = new_clusters
             self.n_clusters = len(self.clusters)
 
-            # Оцінюємо нову конфігурацію
-            new_labels = self.predict(X)
-            if len(np.unique(new_labels)) > 1:
-                new_score = silhouette_score(X, new_labels)
-                ari_score = adjusted_rand_score(y_true, new_labels) if 'y_true' in globals() else 0
-
-                print(f"  New score: {new_score:.4f} (ARI: {ari_score:.4f})")
-
-                # Зберігаємо якщо краще
-                if new_score > self.best_score:
-                    self.best_score = new_score
-                    self.best_configuration = {
-                        'clusters': [cluster.copy() for cluster in self.clusters],
-                        'n_clusters': self.n_clusters,
-                        'score': new_score,
-                        'labels': new_labels.copy()
-                    }
-                    print(f"  ✅ New best configuration!")
-
-                self.backward_history.append({
-                    'n_clusters': self.n_clusters,
-                    'silhouette': new_score,
-                    'ari': ari_score,
-                    'merge_score': best_merge_score
-                })
-
-            # Зупиняємося якщо досягли цільової кількості
-            if self.target_clusters and self.n_clusters <= self.target_clusters:
-                print(f"  Reached target clusters: {self.target_clusters}")
+            if not any_split:
                 break
 
-        # Відновлюємо найкращу конфігурацію
-        if self.best_configuration:
-            print(f"\n[RESTORE] Restoring best configuration:")
-            print(f"  Clusters: {self.best_configuration['n_clusters']}")
-            print(f"  Score: {self.best_configuration['score']:.4f}")
-
-            self.clusters = self.best_configuration['clusters']
-            self.n_clusters = self.best_configuration['n_clusters']
+        return self
 
     def predict(self, X):
-        """Передбачення міток кластерів"""
-        if self.n_clusters == 1:
+        if self.n_clusters <= 1:
             return np.zeros(len(X), dtype=int)
 
         labels = np.zeros(len(X))
-
         for i, point in enumerate(X):
             best_cluster = 0
             best_score = -np.inf
@@ -407,223 +348,585 @@ class ImprovedMolecularDPMM:
             for j, cluster in enumerate(self.clusters):
                 try:
                     likelihood = multivariate_normal.logpdf(point, cluster['mean'], cluster['cov'])
-                    distance = np.linalg.norm(point - cluster['mean'])
-                    score = likelihood - distance * 0.1 + np.log(cluster['weight'])
-
+                    score = likelihood + np.log(cluster['weight'])
                     if score > best_score:
                         best_score = score
                         best_cluster = j
                 except:
                     distance = np.linalg.norm(point - cluster['mean'])
                     score = -distance + np.log(cluster['weight'])
-
                     if score > best_score:
                         best_score = score
                         best_cluster = j
 
             labels[i] = best_cluster
-
         return labels.astype(int)
 
+
+
+class ImprovedMolecularDPMM:
+    def __init__(self, alpha=1.0, max_iter=12, min_cluster_size=5,
+                 initial_split_threshold=0.3, refinement_threshold=0.1,
+                 max_clusters=40, use_smart_init=True,
+                 backward_optimization=True,
+                 verbose=False):
+        self.alpha = alpha
+        self.max_iter = max_iter
+        self.min_cluster_size = min_cluster_size
+        self.initial_split_threshold = initial_split_threshold
+        self.refinement_threshold = refinement_threshold
+        self.max_clusters = max_clusters
+        self.use_smart_init = use_smart_init
+        self.backward_optimization = backward_optimization
+        self.verbose = verbose
+        self.clusters = []
+        self.n_clusters = 0
+
+    def _log(self, message):
+        if self.verbose:
+            print(message)
+
+    def _make_cluster(self, data):
+        mean = np.mean(data, axis=0)
+        cov = np.cov(data.T) + np.eye(data.shape[1]) * 1e-6
+        inv_cov = np.linalg.inv(cov)
+        log_det = np.linalg.slogdet(cov)[1]
+        return {
+            'data': data,
+            'mean': mean,
+            'cov': cov,
+            'inv_cov': inv_cov,
+            'log_det': log_det,
+            'weight': len(data),
+            'size': len(data)
+        }
+
+    def _smart_initialization(self, X):
+        best_k = 1
+        best_score = -np.inf
+        for k in range(2, min(8, len(X) // 50)):
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(X)
+            if len(np.unique(labels)) > 1:
+                score = silhouette_score(X, labels)
+                if score > best_score:
+                    best_score = score
+                    best_k = k
+        if best_k > 1:
+            kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(X)
+            self.clusters = [self._make_cluster(X[labels == i]) for i in range(best_k)]
+            self.n_clusters = len(self.clusters)
+            return True
+        return False
+
+    def _log_likelihood(self, X, cluster):
+        diff = X - cluster['mean']
+        mahal = np.einsum('ij,jk,ik->i', diff, cluster['inv_cov'], diff)
+        return -0.5 * (mahal + cluster['log_det'] + X.shape[1] * np.log(2 * np.pi))
+
+    def _log_likelihood_total(self, data):
+        try:
+            gmm = GaussianMixture(n_components=1, covariance_type='full', random_state=42)
+            gmm.fit(data)
+            return gmm.score(data) * len(data)
+        except:
+            return -np.inf
+
+    def _combined_split_score(self, part1, part2, original):
+        comp0 = np.mean(np.linalg.norm(original - np.mean(original, axis=0), axis=1))
+        comp1 = np.mean(np.linalg.norm(part1 - np.mean(part1, axis=0), axis=1))
+        comp2 = np.mean(np.linalg.norm(part2 - np.mean(part2, axis=0), axis=1))
+        improvement = (comp0 - (comp1 * len(part1) + comp2 * len(part2)) / len(original)) / (comp0 + 1e-8)
+        separation = np.linalg.norm(np.mean(part1, axis=0) - np.mean(part2, axis=0)) / ((comp1 + comp2) / 2 + 1e-8)
+        balance = min(len(part1), len(part2)) / max(len(part1), len(part2))
+
+        # Log-likelihood gain
+        ll_parent = self._log_likelihood_total(original)
+        ll_split = self._log_likelihood_total(part1) + self._log_likelihood_total(part2)
+        ll_gain = (ll_split - ll_parent) / (abs(ll_parent) + 1e-8)
+
+        return 0.3 * improvement + 0.25 * min(separation, 2.0) + 0.2 * balance + 0.25 * ll_gain
+
+    def _em_refinement(self, X):
+        N = X.shape[0]
+        R = np.full((N, self.n_clusters), -np.inf)
+        for i, cluster in enumerate(self.clusters):
+            R[:, i] = self._log_likelihood(X, cluster) + np.log(cluster['weight'])
+        labels = np.argmax(R, axis=1)
+        self.clusters = []
+        for i in range(self.n_clusters):
+            points = X[labels == i]
+            if len(points) >= self.min_cluster_size:
+                self.clusters.append(self._make_cluster(points))
+        self.n_clusters = len(self.clusters)
+
+    def _merge_pair(self, i, j):
+        ci, cj = self.clusters[i], self.clusters[j]
+        dist = np.linalg.norm(ci['mean'] - cj['mean'])
+        comp_comb = np.mean(np.linalg.norm(
+            np.vstack([ci['data'], cj['data']]) - np.mean(np.vstack([ci['data'], cj['data']]), axis=0), axis=1))
+        comp_orig = (
+            np.mean(np.linalg.norm(ci['data'] - ci['mean'], axis=1)) * ci['size'] +
+            np.mean(np.linalg.norm(cj['data'] - cj['mean'], axis=1)) * cj['size']) / (ci['size'] + cj['size'])
+        merge_score = 0.5 * (comp_orig - comp_comb) + 0.5 * (1 / (dist + 1))
+        return (merge_score, i, j)
+
+    def _merge_clusters_parallel(self):
+        indices = list(range(self.n_clusters))
+        mid = len(indices) // 2
+        ranges = [(i, j) for i in indices[:mid] for j in indices[mid:] if i < j]
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [executor.submit(self._merge_pair, i, j) for i, j in ranges]
+            results = [f.result() for f in futures]
+
+        best = max(results, key=lambda x: x[0], default=None)
+        if best and best[0] > 0.05:
+            i, j = best[1], best[2]
+            new_data = np.vstack([self.clusters[i]['data'], self.clusters[j]['data']])
+            self.clusters.pop(max(i, j))
+            self.clusters.pop(min(i, j))
+            self.clusters.append(self._make_cluster(new_data))
+            self.n_clusters = len(self.clusters)
+            self._merge_clusters_parallel()
+
+    def predict(self, X):
+        labels = np.zeros(len(X), dtype=int)
+        for i, x in enumerate(X):
+            best = -np.inf
+            best_idx = 0
+            for j, cluster in enumerate(self.clusters):
+                ll = self._log_likelihood(x[None, :], cluster)[0] + np.log(cluster['weight'])
+                if ll > best:
+                    best = ll
+                    best_idx = j
+            labels[i] = best_idx
+        return labels
+
     def fit(self, X):
-        """Основний алгоритм навчання з зворотним проходом"""
-        print("=== Improved Molecular DPMM with Backward Optimization ===")
-        print(f"Alpha: {self.alpha}, Min size: {self.min_cluster_size}")
-        print(f"Backward optimization: {self.backward_optimization}")
+        if not self._smart_initialization(X):
+            self.clusters = [self._make_cluster(X)]
+            self.n_clusters = 1
 
-        # FORWARD PASS - Поділи кластерів
-        self._initialize_clusters(X)
-        print(f"[INIT] Starting with {self.n_clusters} cluster(s)")
-
-        for iteration in range(self.max_iter):
-            print(f"\n[FORWARD {iteration + 1}] Current clusters: {self.n_clusters}")
-
+        for t in range(self.max_iter):
             new_clusters = []
             any_split = False
-
-            for i, cluster in enumerate(self.clusters):
-                cluster_size = cluster['size']
-                print(f"  Cluster {i + 1}: size={cluster_size}", end='')
-
-                should_split, split_result, score = self._should_split_cluster(cluster, iteration)
-                print(f", score={score:.3f}", end='')
-
-                if should_split and split_result is not None:
-                    part1, part2 = split_result
-                    print(f" → SPLIT ✅ ({len(part1)}+{len(part2)})")
-
-                    for part in [part1, part2]:
-                        new_cluster = {
-                            'data': part,
-                            'mean': np.mean(part, axis=0),
-                            'cov': np.cov(part.T) + np.eye(part.shape[1]) * 1e-6,
-                            'weight': len(part) / len(X),
-                            'size': len(part),
-                            'id': len(new_clusters)
-                        }
-                        new_clusters.append(new_cluster)
-
-                    any_split = True
-                else:
-                    print(" → keep")
+            for cluster in self.clusters:
+                if cluster['size'] < 2 * self.min_cluster_size:
                     new_clusters.append(cluster)
-
+                    continue
+                kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+                labels = kmeans.fit_predict(cluster['data'])
+                part1 = cluster['data'][labels == 0]
+                part2 = cluster['data'][labels == 1]
+                if len(part1) >= 3 and len(part2) >= 3:
+                    score = self._combined_split_score(part1, part2, cluster['data'])
+                    threshold = self.initial_split_threshold if t < 2 else self.refinement_threshold
+                    if score > threshold:
+                        new_clusters.append(self._make_cluster(part1))
+                        new_clusters.append(self._make_cluster(part2))
+                        any_split = True
+                        continue
+                new_clusters.append(cluster)
             self.clusters = new_clusters
             self.n_clusters = len(self.clusters)
-
-            # Оцінка якості
-            if self.n_clusters > 1:
-                labels = self.predict(X)
-                if len(np.unique(labels)) > 1:
-                    quality = silhouette_score(X, labels)
-                    self.quality_history.append(quality)
-                    print(f"  Quality (Silhouette): {quality:.4f}")
-
+            self._em_refinement(X)
+            if self.n_clusters > self.max_clusters:
+                self.clusters = sorted(self.clusters, key=lambda c: c['size'], reverse=True)[:self.max_clusters]
+                self.n_clusters = len(self.clusters)
             if not any_split:
-                print("\n[FORWARD CONVERGENCE] No beneficial splits found")
                 break
-
-        # BACKWARD PASS - Оптимізація через об'єднання
-        if self.backward_optimization and self.n_clusters > 2:
-            self._backward_optimization(X)
-
-        # Фінальна оцінка
-        final_labels = self.predict(X)
-        final_quality = silhouette_score(X, final_labels) if len(np.unique(final_labels)) > 1 else 0
-        final_ari = adjusted_rand_score(y_true, final_labels) if 'y_true' in globals() else 0
-
-        print(f"\n[FINAL] Clusters: {self.n_clusters}")
-        print(f"        Silhouette: {final_quality:.4f}")
-        print(f"        ARI: {final_ari:.4f}")
-
+        if self.backward_optimization:
+            self._merge_clusters_parallel()
         return self
 
+    def predict_proba(self, X):
+        N = X.shape[0]
+        R = np.full((N, self.n_clusters), -np.inf)
+        for i, cluster in enumerate(self.clusters):
+            R[:, i] = self._log_likelihood(X, cluster) + np.log(cluster['weight'])
+        R = np.exp(R - R.max(axis=1, keepdims=True))
+        return R / R.sum(axis=1, keepdims=True)
 
-# === Тестування з зворотним проходом ===
 
-models = [
-    ("Standard", ImprovedMolecularDPMM(
-        alpha=1.0, min_cluster_size=15,
+# === Комплексне тестування ===
+
+def evaluate_model(model, X, y_true, name):
+    """Оцінка моделі з метриками часу"""
+    start_time = time.time()
+
+    try:
+        model.fit(X)
+        labels = model.predict(X)
+
+        fit_time = time.time() - start_time
+
+        n_clusters = len(np.unique(labels))
+
+        if n_clusters > 1:
+            sil_score = silhouette_score(X, labels)
+            ari_score = adjusted_rand_score(y_true, labels)
+            ch_score = calinski_harabasz_score(X, labels)
+        else:
+            sil_score = ari_score = ch_score = 0
+
+        return {
+            'name': name,
+            'model': model,
+            'labels': labels,
+            'n_clusters': n_clusters,
+            'silhouette': sil_score,
+            'ari': ari_score,
+            'calinski_harabasz': ch_score,
+            'fit_time': fit_time,
+            'success': True
+        }
+
+    except Exception as e:
+        return {
+            'name': name,
+            'model': model,
+            'labels': np.zeros(len(X)),
+            'n_clusters': 1,
+            'silhouette': 0,
+            'ari': 0,
+            'calinski_harabasz': 0,
+            'fit_time': time.time() - start_time,
+            'success': False,
+            'error': str(e)
+        }
+
+
+# Модель для порівняння
+models_to_compare = [
+    # Базові методи
+    ("Standard DPMM", StandardDPMM(alpha=1.0, min_cluster_size=5)),
+    ("Variational DPMM", VariationalDPMM(max_components=15, alpha=1.0)),
+    ("Hierarchical DPMM", HierarchicalDPMM(alpha=1.0, max_depth=4, min_cluster_size=5)),
+    ("Adaptive DPMM", AdaptiveDPMM(initial_alpha=1.0, min_cluster_size=5)),
+
+    # Ваші покращені версії
+    ("Improved Standard", ImprovedMolecularDPMM(
+        alpha=1.0, min_cluster_size=5,
         initial_split_threshold=0.25, refinement_threshold=0.45,
-        max_clusters=12, use_smart_init=True,
+        max_clusters=20, use_smart_init=True,
         backward_optimization=False
     )),
-    ("With Backward", ImprovedMolecularDPMM(
-        alpha=1.0, min_cluster_size=15,
+    ("Improved + Backward", ImprovedMolecularDPMM(
+        alpha=1.0, min_cluster_size=5,
         initial_split_threshold=0.25, refinement_threshold=0.45,
-        max_clusters=12, use_smart_init=True,
+        max_clusters=20, use_smart_init=True,
         backward_optimization=True
     )),
-    ("Target-Aware", ImprovedMolecularDPMM(
-        alpha=1.0, min_cluster_size=15,
-        initial_split_threshold=0.2, refinement_threshold=0.4,
-        max_clusters=15, use_smart_init=True,
-        backward_optimization=True, target_clusters=4
-    ))
+
+    # Еталонні методи для порівняння
+    ("Gaussian Mixture", GaussianMixture(n_components=6, random_state=42)),
+    ("Bayesian GMM", BayesianGaussianMixture(n_components=15, random_state=42)),
+    ("K-Means", KMeans(n_clusters=6, random_state=42))
 ]
 
+print("=" * 80)
+print("COMPREHENSIVE DPMM COMPARISON ANALYSIS")
+print("=" * 80)
+print(f"Dataset: {len(X)} samples, {X.shape[1]} features, {len(np.unique(y_true))} true clusters")
+print()
+
 results = []
+for name, model in models_to_compare:
+    print(f"Testing {name}...", end=" ")
+    result = evaluate_model(model, X, y_true, name)
+    results.append(result)
 
-for name, model in models:
-    print(f"\n{'=' * 80}")
-    print(f"Testing: {name}")
-    print('=' * 80)
-
-    model.fit(X)
-    labels = model.predict(X)
-
-    n_clusters = len(np.unique(labels))
-    if n_clusters > 1:
-        sil_score = silhouette_score(X, labels)
-        ari_score = adjusted_rand_score(y_true, labels)
-        ch_score = calinski_harabasz_score(X, labels)
+    if result['success']:
+        print(f"✅ ({result['fit_time']:.2f}s, {result['n_clusters']} clusters)")
     else:
-        sil_score = ari_score = ch_score = 0
+        print(f"❌ Error: {result.get('error', 'Unknown')}")
 
-    results.append({
-        'name': name,
-        'model': model,
-        'labels': labels,
-        'n_clusters': n_clusters,
-        'silhouette': sil_score,
-        'ari': ari_score,
-        'calinski_harabasz': ch_score,
-        'backward_history': getattr(model, 'backward_history', [])
-    })
+# === Результати ===
+print(f"\n{'=' * 100}")
+print("DETAILED COMPARISON RESULTS")
+print('=' * 100)
+print(f"{'Model':<20} {'Clusters':<8} {'Silhouette':<11} {'ARI':<8} {'CH Score':<10} {'Time(s)':<8} {'Status'}")
+print('-' * 100)
+
+successful_results = [r for r in results if r['success']]
+best_ari = max(r['ari'] for r in successful_results) if successful_results else 0
+
+for result in results:
+    if result['success']:
+        is_best = "🏆" if abs(result['ari'] - best_ari) < 0.001 and result['ari'] > 0 else ""
+        status = f"✅ {is_best}"
+    else:
+        status = "❌"
+
+    print(f"{result['name']:<20} {result['n_clusters']:<8} "
+          f"{result['silhouette']:<11.4f} {result['ari']:<8.4f} "
+          f"{result['calinski_harabasz']:<10.0f} "
+          f"{result['fit_time']:<8.2f} {status}")
+
+print(f"\nTrue clusters: {len(np.unique(y_true))}")
+
+# === Статистичний аналіз ===
+print(f"\n{'=' * 60}")
+print("STATISTICAL ANALYSIS")
+print('=' * 60)
+
+if successful_results:
+    # Групування по типам
+    dpmm_results = [r for r in successful_results if 'DPMM' in r['name']]
+    improved_results = [r for r in successful_results if 'Improved' in r['name']]
+    baseline_results = [r for r in successful_results if r['name'] in ['Gaussian Mixture', 'Bayesian GMM', 'K-Means']]
+
+
+    def print_group_stats(group, group_name):
+        if not group:
+            return
+        aris = [r['ari'] for r in group]
+        silhouettes = [r['silhouette'] for r in group]
+        times = [r['fit_time'] for r in group]
+
+        print(f"\n{group_name}:")
+        print(f"  ARI: mean={np.mean(aris):.4f}, std={np.std(aris):.4f}, max={np.max(aris):.4f}")
+        print(f"  Silhouette: mean={np.mean(silhouettes):.4f}, std={np.std(silhouettes):.4f}")
+        print(f"  Time: mean={np.mean(times):.2f}s, std={np.std(times):.2f}s")
+
+
+    print_group_stats(dpmm_results, "DPMM Methods")
+    print_group_stats(improved_results, "Improved Methods")
+    print_group_stats(baseline_results, "Baseline Methods")
 
 # === Візуалізація ===
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-axes = axes.ravel()
+fig = plt.figure(figsize=(20, 16))
 
-# Оригінальні дані
-axes[0].scatter(X[:, 0], X[:, 1], c=y_true, cmap='tab10', s=30, alpha=0.8)
-axes[0].set_title(f'True Clusters (n={len(np.unique(y_true))})', fontsize=14, fontweight='bold')
-axes[0].grid(True, alpha=0.3)
+# Створюємо сітку для підплотів
+n_models = len(successful_results) + 1  # +1 для true labels
+n_cols = 4
+n_rows = (n_models + n_cols - 1) // n_cols
 
-# Результати
-for i, result in enumerate(results):
-    ax = axes[i + 1]
+# True clusters
+ax = plt.subplot(n_rows, n_cols, 1)
+scatter = ax.scatter(X[:, 0], X[:, 1], c=y_true, cmap='tab10', s=15, alpha=0.7)
+ax.set_title(f'True Clusters (n={len(np.unique(y_true))})', fontsize=12, fontweight='bold')
+ax.grid(True, alpha=0.3)
+
+# Результати моделей
+for i, result in enumerate(successful_results, 2):
+    ax = plt.subplot(n_rows, n_cols, i)
     scatter = ax.scatter(X[:, 0], X[:, 1], c=result['labels'],
-                         cmap='tab20', s=30, alpha=0.8)
-    ax.set_title(f"{result['name']}\n"
-                 f"n={result['n_clusters']}, Sil={result['silhouette']:.3f}, "
-                 f"ARI={result['ari']:.3f}", fontsize=14, fontweight='bold')
+                         cmap='tab20', s=15, alpha=0.7)
+
+    title = f"{result['name']}\n"
+    title += f"n={result['n_clusters']}, ARI={result['ari']:.3f}\n"
+    title += f"Sil={result['silhouette']:.3f}, t={result['fit_time']:.1f}s"
+
+    ax.set_title(title, fontsize=10, fontweight='bold')
     ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
 plt.show()
 
-# === Візуалізація історії зворотного проходу ===
-backward_models = [r for r in results if r['backward_history']]
+# === Метрики порівняння ===
+if len(successful_results) > 1:
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
-if backward_models:
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    # ARI vs Time
+    aris = [r['ari'] for r in successful_results]
+    times = [r['fit_time'] for r in successful_results]
+    names = [r['name'] for r in successful_results]
 
-    for result in backward_models:
-        history = result['backward_history']
-        if history:
-            n_clusters = [h['n_clusters'] for h in history]
-            silhouettes = [h['silhouette'] for h in history]
-            aris = [h['ari'] for h in history]
+    axes[0, 0].scatter(times, aris, s=100, alpha=0.7)
+    for i, name in enumerate(names):
+        axes[0, 0].annotate(name, (times[i], aris[i]), xytext=(5, 5),
+                            textcoords='offset points', fontsize=9)
+    axes[0, 0].set_xlabel('Fit Time (seconds)')
+    axes[0, 0].set_ylabel('ARI Score')
+    axes[0, 0].set_title('ARI vs Computation Time')
+    axes[0, 0].grid(True, alpha=0.3)
 
-            axes[0].plot(n_clusters, silhouettes, 'o-', label=result['name'], linewidth=2, markersize=6)
-            axes[1].plot(n_clusters, aris, 's-', label=result['name'], linewidth=2, markersize=6)
+    # Silhouette vs Clusters
+    silhouettes = [r['silhouette'] for r in successful_results]
+    n_clusters = [r['n_clusters'] for r in successful_results]
 
-    axes[0].set_xlabel('Number of Clusters')
-    axes[0].set_ylabel('Silhouette Score')
-    axes[0].set_title('Backward Optimization: Silhouette Score')
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
+    axes[0, 1].scatter(n_clusters, silhouettes, s=100, alpha=0.7)
+    for i, name in enumerate(names):
+        axes[0, 1].annotate(name, (n_clusters[i], silhouettes[i]), xytext=(5, 5),
+                            textcoords='offset points', fontsize=9)
+    axes[0, 1].axvline(x=len(np.unique(y_true)), color='red', linestyle='--', alpha=0.7, label='True clusters')
+    axes[0, 1].set_xlabel('Number of Clusters')
+    axes[0, 1].set_ylabel('Silhouette Score')
+    axes[0, 1].set_title('Silhouette vs Number of Clusters')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
 
-    axes[1].set_xlabel('Number of Clusters')
-    axes[1].set_ylabel('ARI Score')
-    axes[1].set_title('Backward Optimization: ARI Score')
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
+    # ARI comparison bar chart
+    sorted_results = sorted(successful_results, key=lambda x: x['ari'], reverse=True)
+    names_sorted = [r['name'] for r in sorted_results]
+    aris_sorted = [r['ari'] for r in sorted_results]
+
+    bars = axes[1, 0].bar(range(len(names_sorted)), aris_sorted, alpha=0.7)
+    axes[1, 0].set_xticks(range(len(names_sorted)))
+    axes[1, 0].set_xticklabels(names_sorted, rotation=45, ha='right')
+    axes[1, 0].set_ylabel('ARI Score')
+    axes[1, 0].set_title('ARI Score Comparison')
+    axes[1, 0].grid(True, alpha=0.3, axis='y')
+
+    # Добавляем цветовое кодирование
+    for i, bar in enumerate(bars):
+        if i == 0:  # Лучший результат
+            bar.set_color('gold')
+        elif 'Improved' in names_sorted[i]:
+            bar.set_color('lightgreen')
+        elif 'DPMM' in names_sorted[i]:
+            bar.set_color('lightblue')
+        else:
+            bar.set_color('lightcoral')
+
+    # Performance matrix (ARI vs Silhouette)
+    colors = []
+    for result in successful_results:
+        if 'Improved' in result['name']:
+            colors.append('green')
+        elif 'DPMM' in result['name']:
+            colors.append('blue')
+        else:
+            colors.append('red')
+
+    scatter = axes[1, 1].scatter(silhouettes, aris, c=colors, s=100, alpha=0.7)
+    for i, name in enumerate(names):
+        axes[1, 1].annotate(name, (silhouettes[i], aris[i]), xytext=(5, 5),
+                            textcoords='offset points', fontsize=9)
+    axes[1, 1].set_xlabel('Silhouette Score')
+    axes[1, 1].set_ylabel('ARI Score')
+    axes[1, 1].set_title('Performance Matrix (ARI vs Silhouette)')
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # Добавляем легенду для цветов
+    from matplotlib.patches import Patch
+
+    legend_elements = [Patch(facecolor='green', label='Improved Methods'),
+                       Patch(facecolor='blue', label='DPMM Methods'),
+                       Patch(facecolor='red', label='Baseline Methods')]
+    axes[1, 1].legend(handles=legend_elements, loc='best')
 
     plt.tight_layout()
     plt.show()
 
-# === Результати ===
-print(f"\n{'=' * 90}")
-print("FINAL RESULTS WITH BACKWARD OPTIMIZATION")
-print('=' * 90)
-print(f"{'Model':<15} {'Clusters':<8} {'Silhouette':<11} {'ARI':<8} {'CH Score':<10} {'Best':<6}")
-print('-' * 90)
+# === Детальний аналіз найкращих методів ===
+print(f"\n{'=' * 80}")
+print("DETAILED ANALYSIS OF TOP PERFORMERS")
+print('=' * 80)
 
-best_ari = max(r['ari'] for r in results)
-for result in results:
-    is_best = "✅" if abs(result['ari'] - best_ari) < 0.001 else ""
-    print(f"{result['name']:<15} {result['n_clusters']:<8} "
-          f"{result['silhouette']:<11.4f} {result['ari']:<8.4f} "
-          f"{result['calinski_harabasz']:<10.0f} {is_best:<6}")
+# Топ-3 по ARI
+top_3_ari = sorted(successful_results, key=lambda x: x['ari'], reverse=True)[:3]
+print("Top 3 by ARI Score:")
+for i, result in enumerate(top_3_ari, 1):
+    print(f"{i}. {result['name']}: ARI={result['ari']:.4f}, "
+          f"Silhouette={result['silhouette']:.4f}, "
+          f"Clusters={result['n_clusters']}, Time={result['fit_time']:.2f}s")
 
-print(f"\nTrue clusters: {len(np.unique(y_true))}")
+# Топ-3 по Silhouette
+top_3_sil = sorted(successful_results, key=lambda x: x['silhouette'], reverse=True)[:3]
+print(f"\nTop 3 by Silhouette Score:")
+for i, result in enumerate(top_3_sil, 1):
+    print(f"{i}. {result['name']}: Silhouette={result['silhouette']:.4f}, "
+          f"ARI={result['ari']:.4f}, "
+          f"Clusters={result['n_clusters']}, Time={result['fit_time']:.2f}s")
 
-# Показуємо деталі зворотного проходу
-for result in results:
-    if result['backward_history']:
-        print(f"\n{result['name']} - Backward Optimization History:")
-        print("Clusters → Silhouette | ARI")
-        for h in result['backward_history']:
-            print(f"   {h['n_clusters']:2d}    →   {h['silhouette']:.4f}  | {h['ari']:.4f}")
+# Найшвидші методи
+fastest_3 = sorted(successful_results, key=lambda x: x['fit_time'])[:3]
+print(f"\nTop 3 by Speed:")
+for i, result in enumerate(fastest_3, 1):
+    print(f"{i}. {result['name']}: Time={result['fit_time']:.2f}s, "
+          f"ARI={result['ari']:.4f}, "
+          f"Silhouette={result['silhouette']:.4f}")
+
+# Збалансований рейтинг
+print(f"\n{'=' * 60}")
+print("BALANCED RANKING (ARI + Silhouette + Speed)")
+print('=' * 60)
+
+# Нормалізуємо метрики
+max_ari = max(r['ari'] for r in successful_results)
+max_sil = max(r['silhouette'] for r in successful_results)
+min_time = min(r['fit_time'] for r in successful_results)
+
+balanced_scores = []
+for result in successful_results:
+    # Нормалізовані метрики (0-1)
+    norm_ari = result['ari'] / max_ari if max_ari > 0 else 0
+    norm_sil = result['silhouette'] / max_sil if max_sil > 0 else 0
+    norm_speed = min_time / result['fit_time'] if result['fit_time'] > 0 else 0
+
+    # Збалансований скор (вага: ARI=40%, Silhouette=40%, Speed=20%)
+    balanced_score = norm_ari * 0.4 + norm_sil * 0.4 + norm_speed * 0.2
+
+    balanced_scores.append({
+        'name': result['name'],
+        'score': balanced_score,
+        'ari': result['ari'],
+        'silhouette': result['silhouette'],
+        'time': result['fit_time'],
+        'clusters': result['n_clusters']
+    })
+
+# Сортуємо по збалансованому скору
+balanced_scores.sort(key=lambda x: x['score'], reverse=True)
+
+print(f"{'Rank':<4} {'Model':<20} {'Score':<7} {'ARI':<7} {'Sil':<7} {'Time':<7} {'Clusters'}")
+print('-' * 70)
+for i, result in enumerate(balanced_scores, 1):
+    print(f"{i:<4} {result['name']:<20} {result['score']:.3f}   "
+          f"{result['ari']:.3f}   {result['silhouette']:.3f}   "
+          f"{result['time']:.2f}s   {result['clusters']}")
+
+# === Рекомендації ===
+print(f"\n{'=' * 80}")
+print("RECOMMENDATIONS")
+print('=' * 80)
+
+best_overall = balanced_scores[0]
+best_ari = max(successful_results, key=lambda x: x['ari'])
+fastest = min(successful_results, key=lambda x: x['fit_time'])
+
+print(f"🏆 BEST OVERALL: {best_overall['name']}")
+print(f"   → Balanced performance across all metrics")
+print(f"   → Score: {best_overall['score']:.3f}, ARI: {best_overall['ari']:.3f}")
+
+print(f"\n🎯 HIGHEST ACCURACY: {best_ari['name']}")
+print(f"   → Best cluster recovery (ARI: {best_ari['ari']:.3f})")
+print(f"   → Use when accuracy is most important")
+
+print(f"\n⚡ FASTEST: {fastest['name']}")
+print(f"   → Fastest execution ({fastest['fit_time']:.2f}s)")
+print(f"   → Use for large datasets or real-time applications")
+
+# Специфічні рекомендації
+print(f"\n📋 SPECIFIC USE CASES:")
+print(f"   • High-dimensional data: {max(successful_results, key=lambda x: x['silhouette'])['name']}")
+print(
+    f"   • Unknown cluster count: {[r['name'] for r in successful_results if 'Improved' in r['name']][0] if any('Improved' in r['name'] for r in successful_results) else 'N/A'}")
+print(f"   • Real-time processing: {fastest['name']}")
+print(f"   • Research/exploration: {best_ari['name']}")
+
+# === Підсумок ===
+print(f"\n{'=' * 80}")
+print("SUMMARY")
+print('=' * 80)
+print(f"• Total models tested: {len(models_to_compare)}")
+print(f"• Successful runs: {len(successful_results)}")
+print(f"• True clusters: {len(np.unique(y_true))}")
+print(f"• Best ARI achieved: {best_ari['ari']:.4f} ({best_ari['name']})")
+print(f"• Best Silhouette: {max(r['silhouette'] for r in successful_results):.4f}")
+print(
+    f"• Execution time range: {min(r['fit_time'] for r in successful_results):.2f}s - {max(r['fit_time'] for r in successful_results):.2f}s")
+
+print(
+    f"\n✅ Analysis complete! The improved DPMM methods show {'superior' if any('Improved' in r['name'] for r in balanced_scores[:3]) else 'competitive'} performance.")
+
+# === Експорт результатів ===
+print(f"\n📊 Results saved to variables:")
+print(f"   • results: List of all model results")
+print(f"   • balanced_scores: Ranked by balanced performance")
+print(f"   • successful_results: Only successful model runs")
+print(f"   • X, y_true: Original dataset and true labels")

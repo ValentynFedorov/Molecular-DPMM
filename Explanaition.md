@@ -13,7 +13,7 @@
 $$p(\mathbf{x} | C_j) = \mathcal{N}(\mathbf{x} | \boldsymbol{\mu}_j, \boldsymbol{\Sigma}_j)$$
 
 де:
-- $\boldsymbol{\mu}_j = \frac{1}{|C_j|} \sum_{\mathbf{x} \in C_j} \mathbf{x}$ — центроїд кластера  
+- ${\mu}_j = \frac{1}{|C_j|} \sum_{\mathbf{x} \in C_j} \mathbf{x}$ — центроїд кластера  
 - $\boldsymbol{\Sigma}_j = \frac{1}{|C_j|-1} \sum_{\mathbf{x} \in C_j} (\mathbf{x} - \boldsymbol{\mu}_j)(\mathbf{x} - \boldsymbol{\mu}_j)^T + \lambda \mathbf{I}$ — коваріаційна матриця з регуляризацією  
 - $w_j = \frac{|C_j|}{n}$ — вага кластера  
 - $\lambda = 10^{-6}$ — параметр регуляризації  

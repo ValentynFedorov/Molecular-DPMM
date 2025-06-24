@@ -11,6 +11,7 @@ import warnings
 from sklearn.model_selection import GridSearchCV
 from sklearn.base import BaseEstimator, ClusterMixin
 import time
+from scipy.stats import beta, gamma
 import logging
 import concurrent.futures
 
@@ -18,7 +19,7 @@ warnings.filterwarnings('ignore')
 
 # Generate sample data
 np.random.seed(42)
-X, y_true = make_blobs(n_samples=6000, centers=12, cluster_std=1, random_state=42)
+X, y_true = make_blobs(n_samples=6000, centers=10, cluster_std=0.6, random_state=42)
 
 
 # === Додаткові DPMM моделі ===
@@ -363,191 +364,266 @@ class AdaptiveDPMM:
         return labels.astype(int)
 
 
+import numpy as np
+from scipy.stats import invwishart, multivariate_normal
+from sklearn.base import BaseEstimator, ClusterMixin
 
-class ImprovedMolecularDPMM:
-    def __init__(self, alpha=1.0, max_iter=12, min_cluster_size=5,
-                 initial_split_threshold=0.3, refinement_threshold=0.1,
-                 max_clusters=40, use_smart_init=True,
-                 backward_optimization=True,
-                 verbose=False):
+
+class ImprovedMolecularDPMM(BaseEstimator, ClusterMixin):
+    """
+    DP-мікс Гаусіан з умовно-кон'югатними NIW-priors та Gibbs sampling.
+    Реалізує sklearn-совісний API: fit, predict, predict_proba, score, log_likelihood.
+    """
+
+    def __init__(self, alpha=1.0, n_iter=100, kappa_0=None, xi_0=None, beta_0=None, W_0=None, verbose=False):
+        """
+        alpha: концентраційний параметр DP.
+        n_iter: кількість ітерацій Gibbs sampling.
+        kappa_0, xi_0, beta_0, W_0: гіперпараметри NIW prior (за замовчуванням задаються по даним).
+        """
         self.alpha = alpha
-        self.max_iter = max_iter
-        self.min_cluster_size = min_cluster_size
-        self.initial_split_threshold = initial_split_threshold
-        self.refinement_threshold = refinement_threshold
-        self.max_clusters = max_clusters
-        self.use_smart_init = use_smart_init
-        self.backward_optimization = backward_optimization
+        self.n_iter = n_iter
+        self.kappa_0 = kappa_0
+        self.xi_0 = xi_0
+        self.beta_0 = beta_0
+        self.W_0 = W_0
         self.verbose = verbose
-        self.clusters = []
-        self.n_clusters = 0
 
-    def _log(self, message):
-        if self.verbose:
-            print(message)
+    def _initialize_hyperparams(self, X):
+        """Ініціалізація гіперпараметрів на основі даних X, якщо вони не задані."""
+        N, D = X.shape
+        sample_mean = np.mean(X, axis=0)
+        sample_cov = np.cov(X.T) + np.eye(D) * 1e-6
+        # Якщо параметри не задані, ставимо 'невілюючі' значення за емпіричними оцінками
+        if self.xi_0 is None:
+            self.xi_0 = sample_mean
+        if self.kappa_0 is None:
+            self.kappa_0 = 1.0
+        if self.beta_0 is None:
+            self.beta_0 = D + 2
+        if self.W_0 is None:
+            self.W_0 = sample_cov
 
-    def _make_cluster(self, data):
-        mean = np.mean(data, axis=0)
-        cov = np.cov(data.T) + np.eye(data.shape[1]) * 1e-6
-        inv_cov = np.linalg.inv(cov)
-        log_det = np.linalg.slogdet(cov)[1]
-        return {
-            'data': data,
-            'mean': mean,
-            'cov': cov,
-            'inv_cov': inv_cov,
-            'log_det': log_det,
-            'weight': len(data),
-            'size': len(data)
-        }
+    def _sample_cluster_params(self, Xj):
+        """
+        Зразкування параметрів кластера (mu, Sigma) з posterior NIW,
+        де Xj — дані кластера. Якщо даних немає, використовується prior.
+        """
+        D = Xj.shape[1]
+        n_j = Xj.shape[0]
+        if n_j > 0:
+            # Оновлюємо NIW-параметри
+            x_mean = np.mean(Xj, axis=0)
+            S = np.dot((Xj - x_mean).T, (Xj - x_mean))
+            kappa_n = self.kappa_0 + n_j
+            xi_n = (self.kappa_0 * self.xi_0 + n_j * x_mean) / kappa_n
+            beta_n = self.beta_0 + n_j
+            diff = x_mean - self.xi_0
+            W_n = self.W_0 + S + (self.kappa_0 * n_j / kappa_n) * np.outer(diff, diff)
+            # Зразок Sigma ~ InvWishart(beta_n, W_n) та mu ~ N(xi_n, Sigma/kappa_n)
+            Sigma = invwishart.rvs(df=beta_n, scale=W_n)
+            mu = multivariate_normal.rvs(mean=xi_n, cov=Sigma / kappa_n)
+            return mu, Sigma
+        else:
+            # Немає даних: зразкуємо з prior
+            Sigma = invwishart.rvs(df=self.beta_0, scale=self.W_0)
+            mu = multivariate_normal.rvs(mean=self.xi_0, cov=Sigma / self.kappa_0)
+            return mu, Sigma
 
-    def _smart_initialization(self, X):
-        best_k = 1
-        best_score = -np.inf
-        for k in range(2, min(8, len(X) // 50)):
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(X)
-            if len(np.unique(labels)) > 1:
-                score = silhouette_score(X, labels)
-                if score > best_score:
-                    best_score = score
-                    best_k = k
-        if best_k > 1:
-            kmeans = KMeans(n_clusters=best_k, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(X)
-            self.clusters = [self._make_cluster(X[labels == i]) for i in range(best_k)]
-            self.n_clusters = len(self.clusters)
-            return True
-        return False
+    def fit(self, X, y=None):
+        """
+        Навчання моделі DP-GMM за допомогою Gibbs sampling з безпечною переіндексацією кластерів.
+        """
+        X = np.asarray(X)
+        N, D = X.shape
+        self._initialize_hyperparams(X)
 
-    def _log_likelihood(self, X, cluster):
-        diff = X - cluster['mean']
-        mahal = np.einsum('ij,jk,ik->i', diff, cluster['inv_cov'], diff)
-        return -0.5 * (mahal + cluster['log_det'] + X.shape[1] * np.log(2 * np.pi))
+        # Ініціалізація: усі точки в одному кластері
+        assignments = np.zeros(N, dtype=int)
+        clusters = {0: list(range(N))}
+        mu_list = []
+        Sigma_list = []
 
-    def _log_likelihood_total(self, data):
-        try:
-            gmm = GaussianMixture(n_components=1, covariance_type='full', random_state=42)
-            gmm.fit(data)
-            return gmm.score(data) * len(data)
-        except:
-            return -np.inf
+        mu_0, Sigma_0 = self._sample_cluster_params(X)
+        mu_list.append(mu_0)
+        Sigma_list.append(Sigma_0)
 
-    def _combined_split_score(self, part1, part2, original):
-        comp0 = np.mean(np.linalg.norm(original - np.mean(original, axis=0), axis=1))
-        comp1 = np.mean(np.linalg.norm(part1 - np.mean(part1, axis=0), axis=1))
-        comp2 = np.mean(np.linalg.norm(part2 - np.mean(part2, axis=0), axis=1))
-        improvement = (comp0 - (comp1 * len(part1) + comp2 * len(part2)) / len(original)) / (comp0 + 1e-8)
-        separation = np.linalg.norm(np.mean(part1, axis=0) - np.mean(part2, axis=0)) / ((comp1 + comp2) / 2 + 1e-8)
-        balance = min(len(part1), len(part2)) / max(len(part1), len(part2))
+        for it in range(self.n_iter):
+            if self.verbose:
+                print(f"Iteration {it + 1}/{self.n_iter}")
+                print(f"  Clusters: {len(clusters)}")
 
-        # Log-likelihood gain
-        ll_parent = self._log_likelihood_total(original)
-        ll_split = self._log_likelihood_total(part1) + self._log_likelihood_total(part2)
-        ll_gain = (ll_split - ll_parent) / (abs(ll_parent) + 1e-8)
+            for i in range(N):
+                curr_cluster = assignments[i]
+                # Видаляємо точку i з поточного кластеру
+                clusters[curr_cluster].remove(i)
 
-        return 0.3 * improvement + 0.25 * min(separation, 2.0) + 0.2 * balance + 0.25 * ll_gain
+                # Якщо кластер порожній — видаляємо його
+                if len(clusters[curr_cluster]) == 0:
+                    del clusters[curr_cluster]
 
-    def _em_refinement(self, X):
-        N = X.shape[0]
-        R = np.full((N, self.n_clusters), -np.inf)
-        for i, cluster in enumerate(self.clusters):
-            R[:, i] = self._log_likelihood(X, cluster) + np.log(cluster['weight'])
-        labels = np.argmax(R, axis=1)
-        self.clusters = []
-        for i in range(self.n_clusters):
-            points = X[labels == i]
-            if len(points) >= self.min_cluster_size:
-                self.clusters.append(self._make_cluster(points))
-        self.n_clusters = len(self.clusters)
+                    # Створюємо нову переіндексацію
+                    old_to_new = {}
+                    new_clusters = {}
+                    new_mu_list = []
+                    new_Sigma_list = []
+                    new_idx = 0
 
-    def _merge_pair(self, i, j):
-        ci, cj = self.clusters[i], self.clusters[j]
-        dist = np.linalg.norm(ci['mean'] - cj['mean'])
-        comp_comb = np.mean(np.linalg.norm(
-            np.vstack([ci['data'], cj['data']]) - np.mean(np.vstack([ci['data'], cj['data']]), axis=0), axis=1))
-        comp_orig = (
-            np.mean(np.linalg.norm(ci['data'] - ci['mean'], axis=1)) * ci['size'] +
-            np.mean(np.linalg.norm(cj['data'] - cj['mean'], axis=1)) * cj['size']) / (ci['size'] + cj['size'])
-        merge_score = 0.5 * (comp_orig - comp_comb) + 0.5 * (1 / (dist + 1))
-        return (merge_score, i, j)
+                    for old_idx in sorted(clusters.keys()):
+                        old_to_new[old_idx] = new_idx
+                        new_clusters[new_idx] = clusters[old_idx]
+                        new_mu_list.append(mu_list[old_idx])
+                        new_Sigma_list.append(Sigma_list[old_idx])
+                        new_idx += 1
 
-    def _merge_clusters_parallel(self):
-        indices = list(range(self.n_clusters))
-        mid = len(indices) // 2
-        ranges = [(i, j) for i in indices[:mid] for j in indices[mid:] if i < j]
+                    clusters = new_clusters
+                    mu_list = new_mu_list
+                    Sigma_list = new_Sigma_list
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(self._merge_pair, i, j) for i, j in ranges]
-            results = [f.result() for f in futures]
+                    # Оновлюємо assignments
+                    for j in range(N):
+                        if assignments[j] == curr_cluster:
+                            assignments[j] = -1  # потрібно перепризначити
+                        elif assignments[j] > curr_cluster:
+                            assignments[j] -= 1
 
-        best = max(results, key=lambda x: x[0], default=None)
-        if best and best[0] > 0.05:
-            i, j = best[1], best[2]
-            new_data = np.vstack([self.clusters[i]['data'], self.clusters[j]['data']])
-            self.clusters.pop(max(i, j))
-            self.clusters.pop(min(i, j))
-            self.clusters.append(self._make_cluster(new_data))
-            self.n_clusters = len(self.clusters)
-            self._merge_clusters_parallel()
+                    # Оновлюємо поточний кластер
+                    curr_cluster = -1
 
-    def predict(self, X):
-        labels = np.zeros(len(X), dtype=int)
-        for i, x in enumerate(X):
-            best = -np.inf
-            best_idx = 0
-            for j, cluster in enumerate(self.clusters):
-                ll = self._log_likelihood(x[None, :], cluster)[0] + np.log(cluster['weight'])
-                if ll > best:
-                    best = ll
-                    best_idx = j
-            labels[i] = best_idx
-        return labels
+                # Обчислюємо лог-імовірності для існуючих кластерів
+                K = len(mu_list)
+                log_probs = []
 
-    def fit(self, X):
-        if not self._smart_initialization(X):
-            self.clusters = [self._make_cluster(X)]
-            self.n_clusters = 1
+                for j in range(K):
+                    nj = len(clusters[j])
+                    ll = multivariate_normal.logpdf(X[i], mean=mu_list[j],
+                                                    cov=Sigma_list[j] + 1e-6 * np.eye(D))
+                    log_probs.append(np.log(nj) + ll)
 
-        for t in range(self.max_iter):
-            new_clusters = []
-            any_split = False
-            for cluster in self.clusters:
-                if cluster['size'] < 2 * self.min_cluster_size:
-                    new_clusters.append(cluster)
-                    continue
-                kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-                labels = kmeans.fit_predict(cluster['data'])
-                part1 = cluster['data'][labels == 0]
-                part2 = cluster['data'][labels == 1]
-                if len(part1) >= 3 and len(part2) >= 3:
-                    score = self._combined_split_score(part1, part2, cluster['data'])
-                    threshold = self.initial_split_threshold if t < 2 else self.refinement_threshold
-                    if score > threshold:
-                        new_clusters.append(self._make_cluster(part1))
-                        new_clusters.append(self._make_cluster(part2))
-                        any_split = True
-                        continue
-                new_clusters.append(cluster)
-            self.clusters = new_clusters
-            self.n_clusters = len(self.clusters)
-            self._em_refinement(X)
-            if self.n_clusters > self.max_clusters:
-                self.clusters = sorted(self.clusters, key=lambda c: c['size'], reverse=True)[:self.max_clusters]
-                self.n_clusters = len(self.clusters)
-            if not any_split:
-                break
-        if self.backward_optimization:
-            self._merge_clusters_parallel()
+                # Додаємо ймовірність нового кластеру
+                base_cov = self.W_0 * (self.kappa_0 + 1) / (self.kappa_0 * (self.beta_0 - D + 1))
+                ll_base = multivariate_normal.logpdf(X[i], mean=self.xi_0, cov=base_cov + 1e-6 * np.eye(D))
+                log_probs.append(np.log(self.alpha) + ll_base)
+
+                # Вибір нового кластера
+                max_lp = max(log_probs)
+                probs = np.exp(np.array(log_probs) - max_lp)
+                probs /= probs.sum()
+                choice = np.random.choice(len(probs), p=probs)
+
+                if choice < K:
+                    assignments[i] = choice
+                    clusters[choice].append(i)
+                else:
+                    new_idx = K
+                    assignments[i] = new_idx
+                    clusters[new_idx] = [i]
+                    mu_new, Sigma_new = self._sample_cluster_params(X[[i]])
+                    mu_list.append(mu_new)
+                    Sigma_list.append(Sigma_new)
+
+            # Переоцінка параметрів кластерів
+            for j, indices in clusters.items():
+                Xj = X[indices] if indices else np.empty((0, D))
+                mu_j, Sigma_j = self._sample_cluster_params(Xj)
+                mu_list[j] = mu_j
+                Sigma_list[j] = Sigma_j
+
+        # Зберігаємо параметри
+        self.cluster_centers_ = np.array(mu_list)
+        self.covariances_ = Sigma_list
+        self.assignments_ = assignments
+        self.n_components_ = len(mu_list)
+        weights = np.array([len(clusters[j]) for j in range(self.n_components_)])
+        self.weights_ = weights / weights.sum()
+
         return self
 
+    def predict(self, X):
+        """
+        Присвоєння кластера кожній точці: максимізуємо log p(x|µ_j,Σ_j) + log w_j.
+        """
+        X = np.asarray(X)
+        N, D = X.shape
+        labels = np.zeros(N, dtype=int)
+        for i in range(N):
+            log_ps = []
+            for j in range(self.n_components_):
+                ll = multivariate_normal.logpdf(X[i], mean=self.cluster_centers_[j],
+                                                cov=self.covariances_[j] + 1e-6 * np.eye(D))
+                log_ps.append(ll + np.log(self.weights_[j] + 1e-16))
+            labels[i] = np.argmax(log_ps)
+        return labels
+
     def predict_proba(self, X):
-        N = X.shape[0]
-        R = np.full((N, self.n_clusters), -np.inf)
-        for i, cluster in enumerate(self.clusters):
-            R[:, i] = self._log_likelihood(X, cluster) + np.log(cluster['weight'])
-        R = np.exp(R - R.max(axis=1, keepdims=True))
-        return R / R.sum(axis=1, keepdims=True)
+        """
+        Ймовірністі приналежності до кластерів (normalized softmax від log-потенціалів).
+        """
+        X = np.asarray(X)
+        N, D = X.shape
+        log_probs = np.zeros((N, self.n_components_))
+        for j in range(self.n_components_):
+            ll = multivariate_normal.logpdf(X, mean=self.cluster_centers_[j],
+                                            cov=self.covariances_[j] + 1e-6 * np.eye(D))
+            log_probs[:, j] = ll + np.log(self.weights_[j] + 1e-16)
+        # softmax normalisation
+        max_ll = np.max(log_probs, axis=1, keepdims=True)
+        probs = np.exp(log_probs - max_ll)
+        probs /= probs.sum(axis=1, keepdims=True)
+        return probs
+
+    def log_likelihood(self, X):
+        """
+        Сума log-щільностей змішаної моделі: log ∏_i ∑_j w_j N(x_i|µ_j,Σ_j).
+        """
+        X = np.asarray(X)
+        N, D = X.shape
+        logL = 0.0
+        for i in range(N):
+            mix_val = 0.0
+            for j in range(self.n_components_):
+                mix_val += self.weights_[j] * multivariate_normal.pdf(
+                    X[i], mean=self.cluster_centers_[j],
+                    cov=self.covariances_[j] + 1e-6 * np.eye(D))
+            logL += np.log(mix_val + 1e-16)
+        return logL
+
+    def leave_one_out_log_likelihood(self, X):
+        """
+        Leave-one-out predictive log-likelihood: для кожної точки i обчислює
+        log p(x_i | X_{\setminus i}). Сумуємо їх.
+        """
+        X = np.asarray(X)
+        N, D = X.shape
+        loo_logL = 0.0
+        counts = np.bincount(self.assignments_, minlength=self.n_components_)
+        for i in range(N):
+            k = self.assignments_[i]
+            n_k = counts[k] - 1
+            total = N - 1 + self.alpha
+            p_i = 0.0
+            for j in range(self.n_components_):
+                n_j = (counts[j] if j != k else n_k)
+                if n_j > 0:
+                    p_ij = (n_j / total) * multivariate_normal.pdf(
+                        X[i], mean=self.cluster_centers_[j],
+                        cov=self.covariances_[j] + 1e-6 * np.eye(D))
+                    p_i += p_ij
+            # Новий кластер
+            base_cov = self.W_0 * (self.kappa_0 + 1) / (self.kappa_0 * (self.beta_0 - D + 1))
+            p_new = (self.alpha / total) * multivariate_normal.pdf(
+                X[i], mean=self.xi_0, cov=base_cov + 1e-6 * np.eye(D))
+            p_i += p_new
+            loo_logL += np.log(p_i + 1e-16)
+        return loo_logL
+
+    def score(self, X):
+        """
+        sklearn-ковський score: повертає середній LOO predictive log-лікенс.
+        """
+        X = np.asarray(X)
+        loo = self.leave_one_out_log_likelihood(X)
+        return loo / X.shape[0]
 
 
 # === Комплексне тестування ===
@@ -606,18 +682,16 @@ models_to_compare = [
     ("Hierarchical DPMM", HierarchicalDPMM(alpha=1.0, max_depth=4, min_cluster_size=5)),
     ("Adaptive DPMM", AdaptiveDPMM(initial_alpha=1.0, min_cluster_size=5)),
 
-    # Ваші покращені версії
+    # Нові покращені версії з Bayesian inference
     ("Improved Standard", ImprovedMolecularDPMM(
-        alpha=1.0, min_cluster_size=5,
-        initial_split_threshold=0.25, refinement_threshold=0.45,
-        max_clusters=20, use_smart_init=True,
-        backward_optimization=False
+        alpha=1.0,
+        n_iter=100,
+        verbose=True
     )),
     ("Improved + Backward", ImprovedMolecularDPMM(
-        alpha=1.0, min_cluster_size=5,
-        initial_split_threshold=0.25, refinement_threshold=0.45,
-        max_clusters=20, use_smart_init=True,
-        backward_optimization=True
+        alpha=1.0,
+        n_iter=100,
+        verbose=True  # наприклад, для відображення прогресу
     )),
 
     # Еталонні методи для порівняння
